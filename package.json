@@ -5,7 +5,9 @@
   "author": "Andronchyk Bohdan",
   "license": "MIT",
   "scripts": {
-    "test": "Hello World"
+    "split": "node ./bin/split-tts-save-pro.js",
+    "merge": "node ./bin/merge-tts-save-pro.js --version $npm_config_version",
+    "watch": "node ./bin/watch-merge.js"
   },
   "keywords": [
     "tabletop-simulator",
@@ -18,6 +20,7 @@
     "modding"
   ],
   "dependencies": {
-    "dotenv": "16.4.5"
+    "dotenv": "16.4.5",
+    "chokidar": "3.6.0"
   }
 }
