@@ -1,0 +1,23 @@
+{
+  "name": "tts-mod-starter",
+  "version": "1.0.0",
+  "description": "Starter project for splitting and merging Tabletop Simulator save files with Lua/XML support",
+  "author": "Andronchyk Bohdan",
+  "license": "MIT",
+  "scripts": {
+    "test": "Hello World"
+  },
+  "keywords": [
+    "tabletop-simulator",
+    "tts",
+    "save",
+    "split",
+    "merge",
+    "lua",
+    "xml",
+    "modding"
+  ],
+  "dependencies": {
+    "dotenv": "16.4.5"
+  }
+}
