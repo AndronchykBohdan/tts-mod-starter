@@ -73,19 +73,18 @@ function cleanDirectory(dirPath) {
   }
 }
 
-function generateFilename(obj, order = null) {
+function generateFilename(obj, order = null, includeNickname = false) {
   const guid = sanitize(obj.GUID || 'noguid');
-  let prefix = 'Unnamed';
-  if (obj.Nickname && obj.Name) {
-    prefix = sanitize(`${obj.Nickname}.${obj.Name}`);
+  let base = 'Unnamed';
+
+  if (includeNickname && obj.Nickname && obj.Name) {
+    base = sanitize(`${obj.Nickname}.${obj.Name}`);
   } else if (obj.Name) {
-    prefix = sanitize(obj.Name);
+    base = sanitize(obj.Name);
   }
 
-  // Add numeric prefix if order is provided
   const orderPrefix = (typeof order === 'number') ? `${padIndex(order)}_` : '';
-
-  return `${orderPrefix}${prefix}_${guid}.json`;
+  return `${orderPrefix}${base}_${guid}.json`;
 }
 
 function generateParentKey(obj) {
@@ -94,14 +93,14 @@ function generateParentKey(obj) {
   return `${nickname}_${guid}`;
 }
 
-function saveObjectToFile(obj, relativePath, parentKey = '', order = null) {
-  const fileName = generateFilename(obj, order);
+// стало: includeNicknameOnFilename — true для топ-левела, false для всех детей
+function saveObjectToFile(obj, relativePath, parentGuid = null, order = null, includeNicknameOnFilename = false) {
+  const fileName = generateFilename(obj, order, includeNicknameOnFilename);
   const dirPath = path.join(outputDir, relativePath);
   const jsonPath = path.join(dirPath, fileName);
 
   fs.mkdirSync(dirPath, { recursive: true });
 
-  // Extract scripts, XML UI, and memo to sibling files; strip from JSON-on-disk
   const basePathNoExt = jsonPath.replace(/\.json$/i, '');
   if (obj.LuaScript && obj.LuaScript.trim()) {
     const cleaned = extractRootModule(obj.LuaScript);
@@ -124,21 +123,20 @@ function saveObjectToFile(obj, relativePath, parentKey = '', order = null) {
   delete objToWrite.Memo;
   fs.writeFileSync(jsonPath, JSON.stringify(objToWrite, null, 2), 'utf-8');
 
-  // Add to manifest with order field
   manifest.push({
     type: obj.Name || 'Object',
     nickname: obj.Nickname || null,
     guid: obj.GUID || null,
     file: path.join(relativePath, fileName),
-    parent: parentKey || null,
-    order: typeof order === 'number' ? order : null,
+    parent: parentGuid || null,        // parent — GUID (как мы уже чинили)
+    order: (typeof order === 'number') ? order : null,
   });
 
-  // Recurse contained with preserved order
   if (Array.isArray(obj.ContainedObjects) && obj.ContainedObjects.length) {
-    const containerRelPath = path.join('Contained', generateParentKey(obj));
+    const containerRelPath = path.join('Contained', `${sanitize(obj.Nickname)}_${sanitize(obj.GUID || 'noguid')}`);
     obj.ContainedObjects.forEach((child, index) =>
-      saveObjectToFile(child, containerRelPath, generateParentKey(obj), index)
+      // для детей includeNicknameOnFilename = false
+      saveObjectToFile(child, containerRelPath, obj.GUID || null, index, false)
     );
   }
 }
@@ -162,7 +160,7 @@ function main() {
   }
 
   // Split top-level objects with order
-  data.ObjectStates.forEach((obj, index) => saveObjectToFile(obj, '.', '', index));
+  data.ObjectStates.forEach((obj, index) => saveObjectToFile(obj, '.', null, index, true));
 
   // Export Global scripts/UI and strip them from base
   const globalDir = path.join(outputDir, 'Global');

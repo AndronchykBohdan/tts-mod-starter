@@ -82,13 +82,32 @@ function fileExistsStrict(entry) {
   }
 }
 
-/** Stable sort by .order field (keeps insertion order when equal/undefined) */
+function getOrderFromFile(entry) {
+  // try explicit numeric .order from manifest first
+  if (typeof entry.order === 'number' && Number.isFinite(entry.order)) {
+    return entry.order; // already 0-based
+  }
+
+  // else parse from filename prefix: 001_Foo_xxx.json -> 0, 002_... -> 1, ...
+  try {
+    const base = path.basename(entry.file);
+    const m = /^(\d{3,})_/.exec(base);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (Number.isFinite(n)) return n - 1; // make 0-based
+    }
+  } catch (_) {}
+
+  // fallback: put to the end preserving relative order
+  return Number.POSITIVE_INFINITY;
+}
+
+/** Stable sort by effective order (manifest .order or filename prefix); keeps insertion order for ties */
 function sortByOrderStable(arr) {
-  return arr.slice().sort((a, b) => {
-    const ao = (typeof a.order === 'number') ? a.order : Number.POSITIVE_INFINITY;
-    const bo = (typeof b.order === 'number') ? b.order : Number.POSITIVE_INFINITY;
-    return ao - bo;
-  });
+  return arr
+    .map((v, idx) => ({ v, idx, key: getOrderFromFile(v) }))
+    .sort((a, b) => (a.key - b.key) || (a.idx - b.idx))
+    .map(o => o.v);
 }
 
 /* ======================= luabundle‑style bundler (exact 1.6.0 format) ======================= */
