@@ -82,7 +82,7 @@ function fileExistsStrict(entry) {
   }
 }
 
-/** Stable sort by .order (keeps insertion order when equal/undefined) */
+/** Stable sort by .order field (keeps insertion order when equal/undefined) */
 function sortByOrderStable(arr) {
   return arr.slice().sort((a, b) => {
     const ao = (typeof a.order === 'number') ? a.order : Number.POSITIVE_INFINITY;
@@ -455,6 +455,7 @@ function main() {
     console.log(`🎨 XML: ${hasIncludes ? 'bundled with includes' : 'simple format'}`);
   }
   console.log(`🆕 Version: ${customVersion}`);
+  console.log('🔢 Order restored from manifest .order field');
 }
 
 main();

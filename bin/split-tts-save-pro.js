@@ -14,6 +14,8 @@ const sanitize = (str) => (str || 'unnamed')
   .replace(/[^\p{L}\p{N}_\-.]/gu, '_')
   .slice(0, 50);
 
+const padIndex = (i) => String(i + 1).padStart(3, '0');
+
 /**
  * Extract ONLY the body of the bundled __root module.
  * Handles bundles like:
@@ -71,7 +73,7 @@ function cleanDirectory(dirPath) {
   }
 }
 
-function generateFilename(obj) {
+function generateFilename(obj, order = null) {
   const guid = sanitize(obj.GUID || 'noguid');
   let prefix = 'Unnamed';
   if (obj.Nickname && obj.Name) {
@@ -79,7 +81,11 @@ function generateFilename(obj) {
   } else if (obj.Name) {
     prefix = sanitize(obj.Name);
   }
-  return `${prefix}_${guid}.json`;
+
+  // Add numeric prefix if order is provided
+  const orderPrefix = (typeof order === 'number') ? `${padIndex(order)}_` : '';
+
+  return `${orderPrefix}${prefix}_${guid}.json`;
 }
 
 function generateParentKey(obj) {
@@ -88,8 +94,8 @@ function generateParentKey(obj) {
   return `${nickname}_${guid}`;
 }
 
-function saveObjectToFile(obj, relativePath, parentKey = '') {
-  const fileName = generateFilename(obj);
+function saveObjectToFile(obj, relativePath, parentKey = '', order = null) {
+  const fileName = generateFilename(obj, order);
   const dirPath = path.join(outputDir, relativePath);
   const jsonPath = path.join(dirPath, fileName);
 
@@ -118,20 +124,21 @@ function saveObjectToFile(obj, relativePath, parentKey = '') {
   delete objToWrite.Memo;
   fs.writeFileSync(jsonPath, JSON.stringify(objToWrite, null, 2), 'utf-8');
 
-  // Add to manifest
+  // Add to manifest with order field
   manifest.push({
     type: obj.Name || 'Object',
     nickname: obj.Nickname || null,
     guid: obj.GUID || null,
     file: path.join(relativePath, fileName),
     parent: parentKey || null,
+    order: typeof order === 'number' ? order : null,
   });
 
-  // Recurse contained
+  // Recurse contained with preserved order
   if (Array.isArray(obj.ContainedObjects) && obj.ContainedObjects.length) {
     const containerRelPath = path.join('Contained', generateParentKey(obj));
-    obj.ContainedObjects.forEach(child =>
-      saveObjectToFile(child, containerRelPath, generateParentKey(obj))
+    obj.ContainedObjects.forEach((child, index) =>
+      saveObjectToFile(child, containerRelPath, generateParentKey(obj), index)
     );
   }
 }
@@ -154,8 +161,8 @@ function main() {
     process.exit(1);
   }
 
-  // Split top-level objects
-  data.ObjectStates.forEach(obj => saveObjectToFile(obj, '.'));
+  // Split top-level objects with order
+  data.ObjectStates.forEach((obj, index) => saveObjectToFile(obj, '.', '', index));
 
   // Export Global scripts/UI and strip them from base
   const globalDir = path.join(outputDir, 'Global');
@@ -202,6 +209,7 @@ function main() {
     !!data.LuaScriptState && 'State',
     !!data.XmlUI && 'UI'
   ].filter(Boolean).join(', ') || 'none'}`);
+  console.log('🔢 Order preserved: files prefixed with numbers (001_, 002_, etc.)');
 }
 
 main();
