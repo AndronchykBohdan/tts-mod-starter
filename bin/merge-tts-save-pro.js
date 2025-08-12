@@ -8,6 +8,10 @@ const buildDir = process.env.BUILD_DIR || './build';
 const archiveDir = process.env.ARCHIVE_DIR || './archive';
 const manifestPath = path.join(srcDir, 'manifest.json');
 
+// Detect CI (e.g., GitHub Actions sets CI=true and GITHUB_ACTIONS=true)
+const isCI = String(process.env.CI).toLowerCase() === 'true'
+  || String(process.env.GITHUB_ACTIONS).toLowerCase() === 'true';
+
 // CLI args
 const args = process.argv.slice(2);
 const getArg = (name) => {
@@ -139,7 +143,8 @@ function main() {
   }
 
   fs.mkdirSync(buildDir, { recursive: true });
-  fs.mkdirSync(archiveDir, { recursive: true });
+  // Создаём archiveDir только локально; в CI архив отключён
+  if (!isCI) fs.mkdirSync(archiveDir, { recursive: true });
 
   const manifest = readJSON(manifestPath);
   const base = readJSON(path.join(srcDir, 'base.json'));
@@ -181,12 +186,17 @@ function main() {
   if (fs.existsSync(globalLua)) merged.LuaScript = fs.readFileSync(globalLua, 'utf-8');
   if (fs.existsSync(globalXml)) merged.XmlUI = fs.readFileSync(globalXml, 'utf-8');
 
-  // In dev builds (version=vDEV) — NO archiving, just overwrite
+  // In dev builds (version=vDEV) OR in CI — NO archiving, just overwrite
   const isDevBuild = /^v?dev$/i.test(String(customVersion).trim());
-  if (!isDevBuild) {
+  if (!isDevBuild && !isCI) {
     archivePreviousBuilds(gameModeRaw);
   } else {
-    console.log('🧪 Dev build detected → archiving is disabled; file will be overwritten.');
+    if (isDevBuild) {
+      console.log('🧪 Dev build detected → archiving is disabled; file will be overwritten.');
+    }
+    if (isCI) {
+      console.log('🛰️ CI detected → archiving is disabled in CI to keep artifacts clean.');
+    }
   }
 
   validateModStructure(merged);
