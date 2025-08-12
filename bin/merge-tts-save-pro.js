@@ -2,13 +2,17 @@
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
+const { bundleXML } = require('./modules/xml-bundler');
 
 const srcDir = process.env.SRC_DIR || './src';
 const buildDir = process.env.BUILD_DIR || './build';
 const archiveDir = process.env.ARCHIVE_DIR || './archive';
 const manifestPath = path.join(srcDir, 'manifest.json');
 
-// Detect CI (e.g., GitHub Actions sets CI=true and GITHUB_ACTIONS=true)
+// Lua modules dir (always on)
+const LIB_DIR = './lib';
+
+// Detect CI
 const isCI = String(process.env.CI).toLowerCase() === 'true'
   || String(process.env.GITHUB_ACTIONS).toLowerCase() === 'true';
 
@@ -26,7 +30,7 @@ if (!customVersion) {
   process.exit(1);
 }
 
-/** Unicode-safe, cross-platform file-name sanitizer (for output save name) */
+/** Unicode-safe, cross-platform file-name sanitizer */
 function sanitizeFileNameStrict(input, fallback = 'TTS_Save') {
   let s = String(input ?? '')
     .normalize('NFC')
@@ -58,7 +62,7 @@ function readJSON(filePath) {
   }
 }
 
-// Validate file exists AND its GUID matches manifest.guid (if both present)
+// Validate presence and (optional) GUID match
 function fileExistsStrict(entry) {
   const fullPath = path.join(srcDir, entry.file);
   if (!fs.existsSync(fullPath)) {
@@ -78,9 +82,8 @@ function fileExistsStrict(entry) {
   }
 }
 
-/** Stable sort by .order (visual filename prefixes are ignored entirely) */
+/** Stable sort by .order (keeps insertion order when equal/undefined) */
 function sortByOrderStable(arr) {
-  // V8 sort is stable; equal keys keep insertion order from manifest.json
   return arr.slice().sort((a, b) => {
     const ao = (typeof a.order === 'number') ? a.order : Number.POSITIVE_INFINITY;
     const bo = (typeof b.order === 'number') ? b.order : Number.POSITIVE_INFINITY;
@@ -88,25 +91,166 @@ function sortByOrderStable(arr) {
   });
 }
 
-// Build object by manifest entry; children resolved strictly by parent GUID and .order
+/* ======================= luabundle‑style bundler (exact 1.6.0 format) ======================= */
+
+function readText(file) { return fs.readFileSync(file, 'utf-8'); }
+
+// require("id") or require 'id'
+const REQUIRE_RE = /(^|\s)require\s*(?:\(\s*["']([^"']+)["']\s*\)|\s+["']([^"']+)["'])/g;
+
+function findRequireIds(luaCode) {
+  const ids = new Set();
+  let m;
+  while ((m = REQUIRE_RE.exec(luaCode)) !== null) {
+    const id = m[2] || m[3];
+    if (id) ids.add(id);
+  }
+  return Array.from(ids);
+}
+
+function resolveModulePath(id) {
+  const parts = id.split('/').filter(Boolean);
+  const base = path.join(LIB_DIR, ...parts);
+  const candidates = [`${base}.lua`, `${base}.ttslua`];
+  for (const file of candidates) if (fs.existsSync(file)) return file;
+  return null;
+}
+
+// emit exact luabundle 1.6.0 header
+function emitLuabundleHeader() {
+  return `-- Bundled by luabundle {"version":"1.6.0"}
+local __bundle_require, __bundle_loaded, __bundle_register, __bundle_modules = (function(superRequire)
+\tlocal loadingPlaceholder = {[{}] = true}
+
+\tlocal register
+\tlocal modules = {}
+
+\tlocal require
+\tlocal loaded = {}
+
+\tregister = function(name, body)
+\t\tif not modules[name] then
+\t\t\tmodules[name] = body
+\t\tend
+\tend
+
+\trequire = function(name)
+\t\tlocal loadedModule = loaded[name]
+
+\t\tif loadedModule then
+\t\t\tif loadedModule == loadingPlaceholder then
+\t\t\t\treturn nil
+\t\t\tend
+\t\telse
+\t\t\tif not modules[name] then
+\t\t\t\tif not superRequire then
+\t\t\t\t\tlocal identifier = type(name) == 'string' and '\"' .. name .. '\"' or tostring(name)
+\t\t\t\t\terror('Tried to require ' .. identifier .. ', but no such module has been registered')
+\t\t\t\telse
+\t\t\t\t\treturn superRequire(name)
+\t\t\t\tend
+\t\t\tend
+
+\t\t\tloaded[name] = loadingPlaceholder
+\t\t\tloadedModule = modules[name](require, loaded, register, modules)
+\t\t\tloaded[name] = loadedModule
+\t\tend
+
+\t\treturn loadedModule
+\tend
+
+\treturn require, loaded, register, modules
+end)(nil)`;
+}
+
+function bundleLuaIfNeeded(rootCode, who = 'script') {
+  const requires = findRequireIds(rootCode);
+  if (requires.length === 0) {
+    // no require → return code unchanged, без рантайма и без return __bundle_require
+    if (debug) console.log(`ℹ️  No requires in ${who} → bundling skipped`);
+    return rootCode;
+  }
+
+  if (!fs.existsSync(LIB_DIR)) {
+    console.error(`❌ Lua requires detected in ${who}, but LIB_DIR not found: ${LIB_DIR}`);
+    console.error(`   Put your modules into ${LIB_DIR} (e.g., ${LIB_DIR}/util/serpent.lua)`);
+    process.exit(1);
+  }
+
+  const visited = new Set();
+  const modules = []; // { id, code }
+
+  function loadModule(id, chain = []) {
+    if (visited.has(id)) return;
+    visited.add(id);
+
+    const file = resolveModulePath(id);
+    if (!file) {
+      console.error(`❌ Missing Lua module "${id}" → expected: ${LIB_DIR}/${id}.lua or .ttslua`);
+      process.exit(1);
+    }
+    const code = readText(file);
+
+    for (const sub of findRequireIds(code)) {
+      if (chain.includes(sub)) {
+        console.warn(`⚠️  Circular require: ${[...chain, sub].join(' -> ')}`);
+        continue;
+      }
+      loadModule(sub, [...chain, id]);
+    }
+
+    modules.push({ id, code });
+  }
+
+  for (const id of requires) loadModule(id, ['__root']);
+
+  const out = [];
+  out.push(emitLuabundleHeader());
+
+  for (const m of modules) {
+    out.push(`__bundle_register("${m.id}", function(require, _LOADED, __bundle_register, __bundle_modules)
+${m.code}
+end)`);
+  }
+
+  out.push(`__bundle_register("__root", function(require, _LOADED, __bundle_register, __bundle_modules)
+${rootCode}
+end)
+
+return __bundle_require("__root")`);
+
+  if (debug) console.log(`🧵 Bundled ${modules.length} module(s) from ${LIB_DIR} for ${who}`);
+  return out.join('\n\n');
+}
+
+/* ======================= END bundler ======================= */
+
+function readObjectLuaIfExists(jsonPath) {
+  const base = jsonPath.replace(/\.json$/i, '');
+  const candidates = [`${base}.lua`, `${base}.ttslua`];
+  for (const p of candidates) if (fs.existsSync(p)) return fs.readFileSync(p, 'utf-8');
+  return null;
+}
+
+// Children by parent GUID (order-preserving)
 function loadObjectFromManifest(entry, manifestMap) {
   const jsonPath = path.join(srcDir, entry.file);
   const obj = readJSON(jsonPath);
 
-  // Attach object-level Lua / State if present next to JSON (same basename, including any numeric prefix)
-  const luaPath = jsonPath.replace(/\.json$/i, '.lua');
+  const rawCode = readObjectLuaIfExists(jsonPath);
   const statePath = jsonPath.replace(/\.json$/i, '.state.txt');
-  if (fs.existsSync(luaPath)) obj.LuaScript = fs.readFileSync(luaPath, 'utf-8');
+  const xmlPath = jsonPath.replace(/\.json$/i, '.xml');
+  const memoPath = jsonPath.replace(/\.json$/i, '.memo.txt');
+
+  if (rawCode != null) {
+    obj.LuaScript = bundleLuaIfNeeded(rawCode, `object:${entry.guid || 'noguid'}`);
+  }
   if (fs.existsSync(statePath)) obj.LuaScriptState = fs.readFileSync(statePath, 'utf-8');
+  if (fs.existsSync(xmlPath)) obj.XmlUI = fs.readFileSync(xmlPath, 'utf-8');
+  if (fs.existsSync(memoPath)) obj.Memo = fs.readFileSync(memoPath, 'utf-8');
 
   const rawChildren = manifestMap[entry.guid] || [];
   const children = sortByOrderStable(rawChildren);
-
-  if (debug) {
-    const orders = children.map(c => (typeof c.order === 'number') ? c.order : null);
-    console.log(`📦 ${path.basename(entry.file)} (GUID=${entry.guid || 'null'}) → children: ${children.length} | order: [${orders.join(', ')}]`);
-  }
-
   if (children.length > 0) {
     obj.ContainedObjects = children.map(child =>
       loadObjectFromManifest(child, manifestMap)
@@ -182,7 +326,7 @@ function validateModStructure(mod) {
   console.log('✅ Validation passed.');
 }
 
-// Robust base name from SaveName -> GameMode -> fallback; safe for all OS
+// Robust base name from SaveName -> GameMode -> fallback
 function pickBaseName(base, topLevelEntries) {
   const primary =
     (typeof base.SaveName === 'string' && base.SaveName.trim()) ? base.SaveName.trim() :
@@ -209,10 +353,10 @@ function main() {
   // Verify manifest files exist and GUIDs match
   manifest.forEach(fileExistsStrict);
 
-  // Group by parent GUID (or __root__) — preserve insertion order from manifest.json
+  // Group by parent GUID (or __root__) — insertion order preserved
   const manifestMap = {};
   for (const entry of manifest) {
-    const key = entry.parent || '__root__'; // parent is GUID or null
+    const key = entry.parent || '__root__';
     if (!manifestMap[key]) manifestMap[key] = [];
     manifestMap[key].push(entry);
   }
@@ -227,11 +371,11 @@ function main() {
     }
   }
 
-  // Top-level strictly by original order (.order)
+  // Top-level strictly by .order
   const topLevel = sortByOrderStable(manifestMap['__root__'] || []);
   const objectStates = topLevel.map(entry => loadObjectFromManifest(entry, manifestMap));
 
-  // Compose robust output filename
+  // Compose output filename
   const baseName = pickBaseName(base, topLevel);
   const versionTag = String(customVersion).trim().replace(/^v+/i, '');
   let versionClean = sanitizeFileNameStrict(versionTag, 'dev').replace(/[^A-Za-z0-9._-]/g, '_');
@@ -239,7 +383,7 @@ function main() {
   const saveFileName = `${baseName}_v${versionClean}.json`;
   const outputFile = path.join(buildDir, saveFileName);
 
-  // Assemble final save (fallbacks inside JSON)
+  // Assemble final save
   const merged = {
     ...base,
     ObjectStates: objectStates,
@@ -248,14 +392,49 @@ function main() {
     VersionNumber: customVersion
   };
 
-  // Global Lua & UI (keeps filenames as-is; numeric prefixes are fine)
+  // Global Lua & UI — prefer .lua, then .ttslua; bundle only if there are requires
   const globalDir = path.join(srcDir, 'Global');
-  const globalLua = path.join(globalDir, 'Global.lua');
-  const globalXml = path.join(globalDir, 'UI.xml');
-  if (fs.existsSync(globalLua)) merged.LuaScript = fs.readFileSync(globalLua, 'utf-8');
-  if (fs.existsSync(globalXml)) merged.XmlUI = fs.readFileSync(globalXml, 'utf-8');
+  const globalLuaCandidates = [path.join(globalDir, 'Global.lua'), path.join(globalDir, 'Global.ttslua')];
+  const globalLuaPath = globalLuaCandidates.find(p => fs.existsSync(p));
 
-  // In dev builds (version=vDEV) OR in CI — NO archiving
+  if (globalLuaPath) {
+    const rawGlobal = fs.readFileSync(globalLuaPath, 'utf-8');
+    merged.LuaScript = bundleLuaIfNeeded(rawGlobal, 'Global');
+  }
+
+  // Global state
+  const globalStateFile = path.join(globalDir, 'Global.state.txt');
+  if (fs.existsSync(globalStateFile)) {
+    merged.LuaScriptState = fs.readFileSync(globalStateFile, 'utf-8');
+  }
+
+  // Smart XML processing with bundling support
+  const globalXml = path.join(globalDir, 'UI.xml');
+  if (fs.existsSync(globalXml)) {
+    const rawXml = fs.readFileSync(globalXml, 'utf-8');
+
+    // Check for <Include> tags
+    if (rawXml.includes('<Include src=')) {
+      // XML bundling needed
+      try {
+        const xmlUIDir = path.join(globalDir, 'UI');
+        const xmlSourceDir = fs.existsSync(xmlUIDir) ? xmlUIDir : globalDir;
+        merged.XmlUI = bundleXML(rawXml, xmlSourceDir);
+        if (debug) console.log(`🎨 XML bundled with includes from ${xmlSourceDir}`);
+      } catch (err) {
+        console.error(`❌ Error bundling XML: ${err.message}`);
+        // Fallback: use raw XML
+        merged.XmlUI = rawXml;
+        console.log('🎨 XML used as fallback due to bundling error');
+      }
+    } else {
+      // Simple XML without includes
+      merged.XmlUI = rawXml;
+      if (debug) console.log('🎨 Simple XML loaded (no includes found)');
+    }
+  }
+
+  // Archiving (off in dev/CI)
   const isDevBuild = /^v?dev$/i.test(String(customVersion).trim());
   if (!isDevBuild && !isCI) {
     archivePreviousBuilds(merged.GameMode);
@@ -270,6 +449,11 @@ function main() {
   console.log(`✅ Merged ${objectStates.length} objects`);
   console.log(`📁 Output saved to: ${outputFile}`);
   console.log(`📝 GameMode: ${merged.GameMode}`);
+  console.log(`🧵 Bundling: luabundle-1.6.0 format (runtime ONLY if require(...) is present)`);
+  if (merged.XmlUI) {
+    const hasIncludes = merged.XmlUI.includes('<!-- include ');
+    console.log(`🎨 XML: ${hasIncludes ? 'bundled with includes' : 'simple format'}`);
+  }
   console.log(`🆕 Version: ${customVersion}`);
 }
 
