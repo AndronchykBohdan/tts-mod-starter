@@ -26,7 +26,7 @@ if (!customVersion) {
   process.exit(1);
 }
 
-/** Unicode-safe, cross-platform file-name sanitizer */
+/** Unicode-safe, cross-platform file-name sanitizer (for output save name) */
 function sanitizeFileNameStrict(input, fallback = 'TTS_Save') {
   let s = String(input ?? '')
     .normalize('NFC')
@@ -78,9 +78,9 @@ function fileExistsStrict(entry) {
   }
 }
 
-/** Stable sort by .order, preserving insertion order when order is equal/undefined */
+/** Stable sort by .order (visual filename prefixes are ignored entirely) */
 function sortByOrderStable(arr) {
-  // Node 22 (V8) sort is stable; comparator keeps equal items in original order.
+  // V8 sort is stable; equal keys keep insertion order from manifest.json
   return arr.slice().sort((a, b) => {
     const ao = (typeof a.order === 'number') ? a.order : Number.POSITIVE_INFINITY;
     const bo = (typeof b.order === 'number') ? b.order : Number.POSITIVE_INFINITY;
@@ -88,18 +88,17 @@ function sortByOrderStable(arr) {
   });
 }
 
-// Children by parent GUID (stable, order-preserving)
+// Build object by manifest entry; children resolved strictly by parent GUID and .order
 function loadObjectFromManifest(entry, manifestMap) {
   const jsonPath = path.join(srcDir, entry.file);
   const obj = readJSON(jsonPath);
 
-  // Object-level Lua/State
+  // Attach object-level Lua / State if present next to JSON (same basename, including any numeric prefix)
   const luaPath = jsonPath.replace(/\.json$/i, '.lua');
   const statePath = jsonPath.replace(/\.json$/i, '.state.txt');
   if (fs.existsSync(luaPath)) obj.LuaScript = fs.readFileSync(luaPath, 'utf-8');
   if (fs.existsSync(statePath)) obj.LuaScriptState = fs.readFileSync(statePath, 'utf-8');
 
-  // children come exactly in manifest order; additionally respect .order if present
   const rawChildren = manifestMap[entry.guid] || [];
   const children = sortByOrderStable(rawChildren);
 
@@ -210,7 +209,7 @@ function main() {
   // Verify manifest files exist and GUIDs match
   manifest.forEach(fileExistsStrict);
 
-  // Group by parent GUID (or __root__) — insertion order equals manifest order
+  // Group by parent GUID (or __root__) — preserve insertion order from manifest.json
   const manifestMap = {};
   for (const entry of manifest) {
     const key = entry.parent || '__root__'; // parent is GUID or null
@@ -228,7 +227,7 @@ function main() {
     }
   }
 
-  // Top-level strictly by original order (.order), preserving insertion when missing
+  // Top-level strictly by original order (.order)
   const topLevel = sortByOrderStable(manifestMap['__root__'] || []);
   const objectStates = topLevel.map(entry => loadObjectFromManifest(entry, manifestMap));
 
@@ -249,7 +248,7 @@ function main() {
     VersionNumber: customVersion
   };
 
-  // Global Lua & UI
+  // Global Lua & UI (keeps filenames as-is; numeric prefixes are fine)
   const globalDir = path.join(srcDir, 'Global');
   const globalLua = path.join(globalDir, 'Global.lua');
   const globalXml = path.join(globalDir, 'UI.xml');
