@@ -8,16 +8,25 @@ const inputPath = process.env.INPUT_SAVE || process.argv[2] || './Save.json';
 const outputDir = './src';
 const manifest = [];
 
-// Unicode-safe sanitize: keep letters, numbers, _ - . ; replace others with _
-const sanitize = (str) => (str || 'unnamed')
-  .replace(/[^\p{L}\p{N}_\-.]/gu, '_')
-  .slice(0, 50);
+// Unicode-safe sanitize
+const sanitize = (str, fallback = 'unnamed') => {
+  let s = String(str || '')
+    .normalize('NFC')
+    .replace(/[\u0000-\u001F\u007F]/g, '')
+    .replace(/\s+/g, '_')
+    .replace(/[^\p{L}\p{N}_\-.]/gu, '_');
+  s = s.replace(/_+/g, '_').replace(/\.{2,}/g, '.');
+  s = s.replace(/^[._]+/, '').replace(/[._]+$/, '');
+  if (!s) s = fallback;
+  return s.slice(0, 50);
+};
 
 function cleanDirectory(dirPath) {
   if (!fs.existsSync(dirPath)) return;
   for (const file of fs.readdirSync(dirPath)) {
     const fullPath = path.join(dirPath, file);
-    if (fs.statSync(fullPath).isDirectory()) {
+    const st = fs.statSync(fullPath);
+    if (st.isDirectory()) {
       cleanDirectory(fullPath);
       fs.rmdirSync(fullPath);
     } else {
@@ -26,36 +35,46 @@ function cleanDirectory(dirPath) {
   }
 }
 
-function generateFilename(obj) {
+// Top-level filename: Nickname.Name_GUID.json (if Nickname), else Name_GUID.json
+function generateTopLevelFilename(obj) {
   const guid = sanitize(obj.GUID || 'noguid');
-  let prefix = 'Unnamed';
   if (obj.Nickname && obj.Name) {
-    prefix = sanitize(`${obj.Nickname}.${obj.Name}`);
-  } else if (obj.Name) {
-    prefix = sanitize(obj.Name);
+    const nick = sanitize(obj.Nickname);
+    const name = sanitize(obj.Name);
+    return `${nick}.${name}_${guid}.json`;
   }
-  return `${prefix}_${guid}.json`;
+  const name = sanitize(obj.Name || 'Object');
+  return `${name}_${guid}.json`;
 }
 
-function generateParentKey(obj) {
-  const nickname = sanitize(obj.Nickname);
+// Nested filename (inside Contained): Name_GUID.json  (no Nickname)
+function generateNestedFilename(obj) {
+  const name = sanitize(obj.Name || 'Object');
   const guid = sanitize(obj.GUID || 'noguid');
-  return `${nickname}_${guid}`;
+  return `${name}_${guid}.json`;
 }
 
-function saveObjectToFile(obj, relativePath, parentKey = '') {
-  const fileName = generateFilename(obj);
+// Folder for children: Contained/<NicknameOrName>_<GUID>
+function generateContainerRelPath(parentObj) {
+  const label = sanitize(parentObj.Nickname || parentObj.Name || 'Object');
+  const guid = sanitize(parentObj.GUID || 'noguid');
+  return path.join('Contained', `${label}_${guid}`);
+}
+
+function saveObjectToFile(obj, relativePath, parentGuid = null) {
+  const isTopLevel = relativePath === '.';
+  const fileName = isTopLevel ? generateTopLevelFilename(obj) : generateNestedFilename(obj);
+
   const dirPath = path.join(outputDir, relativePath);
   const jsonPath = path.join(dirPath, fileName);
-
   fs.mkdirSync(dirPath, { recursive: true });
 
-  // Extract scripts to sibling files; strip from JSON-on-disk
+  // Extract object-level scripts to sibling files; strip from JSON-on-disk
   const basePathNoExt = jsonPath.replace(/\.json$/i, '');
-  if (obj.LuaScript && obj.LuaScript.trim()) {
+  if (obj.LuaScript && String(obj.LuaScript).trim()) {
     fs.writeFileSync(basePathNoExt + '.lua', obj.LuaScript, 'utf-8');
   }
-  if (obj.LuaScriptState && obj.LuaScriptState.trim()) {
+  if (obj.LuaScriptState && String(obj.LuaScriptState).trim()) {
     fs.writeFileSync(basePathNoExt + '.state.txt', obj.LuaScriptState, 'utf-8');
   }
 
@@ -64,21 +83,22 @@ function saveObjectToFile(obj, relativePath, parentKey = '') {
   delete objToWrite.LuaScriptState;
   fs.writeFileSync(jsonPath, JSON.stringify(objToWrite, null, 2), 'utf-8');
 
-  // Add to manifest
+  // Manifest entry — parent is GUID only (stable)
   manifest.push({
     type: obj.Name || 'Object',
+    name: obj.Name || null,
     nickname: obj.Nickname || null,
     guid: obj.GUID || null,
     file: path.join(relativePath, fileName),
-    parent: parentKey || null,
+    parent: parentGuid, // GUID of parent or null at top level
   });
 
   // Recurse contained
   if (Array.isArray(obj.ContainedObjects) && obj.ContainedObjects.length) {
-    const containerRelPath = path.join('Contained', generateParentKey(obj));
-    obj.ContainedObjects.forEach(child =>
-      saveObjectToFile(child, containerRelPath, generateParentKey(obj))
-    );
+    const containerRelPath = generateContainerRelPath(obj); // folder uses Nickname/Name + GUID
+    for (const child of obj.ContainedObjects) {
+      saveObjectToFile(child, containerRelPath, obj.GUID || null);
+    }
   }
 }
 
@@ -93,7 +113,13 @@ function main() {
   cleanDirectory(outputDir);
 
   const raw = fs.readFileSync(inputPath, 'utf-8');
-  const data = JSON.parse(raw);
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    console.error(`❌ Invalid JSON: ${inputPath}`);
+    process.exit(1);
+  }
 
   if (!Array.isArray(data.ObjectStates)) {
     console.error('❌ Save file does not contain ObjectStates array!');
@@ -101,18 +127,20 @@ function main() {
   }
 
   // Split top-level objects
-  data.ObjectStates.forEach(obj => saveObjectToFile(obj, '.'));
+  for (const obj of data.ObjectStates) {
+    saveObjectToFile(obj, '.');
+  }
 
   // Export Global scripts/UI and strip them from base
   const globalDir = path.join(outputDir, 'Global');
   fs.mkdirSync(globalDir, { recursive: true });
-  if (data.LuaScript && data.LuaScript.trim()) {
+  if (data.LuaScript && String(data.LuaScript).trim()) {
     fs.writeFileSync(path.join(globalDir, 'Global.lua'), data.LuaScript, 'utf-8');
   }
-  if (data.LuaScriptState && data.LuaScriptState.trim()) {
+  if (data.LuaScriptState && String(data.LuaScriptState).trim()) {
     fs.writeFileSync(path.join(globalDir, 'Global.state.txt'), data.LuaScriptState, 'utf-8');
   }
-  if (data.XmlUI && data.XmlUI.trim()) {
+  if (data.XmlUI && String(data.XmlUI).trim()) {
     fs.writeFileSync(path.join(globalDir, 'UI.xml'), data.XmlUI, 'utf-8');
   }
 
