@@ -25,9 +25,43 @@ if (!customVersion) {
   process.exit(1);
 }
 
-// Helper utils
-const sanitizeFileName = (str) =>
-  String(str).replace(/[^\p{L}\p{N}_\-.]/gu, '_').slice(0, 50);
+/**
+ * Strict, cross-platform file-name sanitizer:
+ * - Unicode-friendly (keeps letters/digits from any script)
+ * - Removes control chars, forbids illegal path chars
+ * - Collapses repeats, trims leading/trailing dots/underscores/spaces
+ * - Avoids Windows reserved basenames (CON, PRN, AUX, NUL, COM1..9, LPT1..9)
+ * - Ensures non-empty; caps length to 50
+ */
+function sanitizeFileNameStrict(input, fallback = 'TTS_Save') {
+  let s = String(input ?? '')
+    .normalize('NFC')                      // unify accents, etc.
+    .replace(/[\u0000-\u001F\u007F]/g, '') // drop control chars
+    .replace(/\s+/g, '_')                  // spaces -> underscore
+    // keep Unicode letters/digits/_/.- ; everything else -> _
+    .replace(/[^\p{L}\p{N}_\-.]/gu, '_');
+
+  // collapse repeats
+  s = s.replace(/_+/g, '_').replace(/\.{2,}/g, '.');
+
+  // trim leading/trailing dots/underscores/spaces
+  s = s.replace(/^[\s._]+/, '').replace(/[\s._]+$/, '');
+
+  // disallow purely '.' or empty after trim
+  if (!s || s === '.' || s === '..') s = fallback;
+
+  // Windows reserved basenames protection (case-insensitive)
+  const reserved = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+  if (reserved.test(s)) s = '_' + s;
+
+  // cap length
+  if (s.length > 50) s = s.slice(0, 50);
+
+  // final safety: if became empty after slicing
+  if (!s) s = fallback;
+
+  return s;
+}
 
 const getTimestamp = () =>
   new Date().toISOString().replace(/[:]/g, '-').split('.')[0];
@@ -136,6 +170,18 @@ function validateModStructure(mod) {
   console.log('✅ Validation passed.');
 }
 
+// Robust base name from SaveName -> GameMode -> fallback; safe for all OS
+function pickBaseName(base, topLevelEntries) {
+  const primary =
+    (typeof base.SaveName === 'string' && base.SaveName.trim()) ? base.SaveName.trim() :
+      (typeof base.GameMode === 'string' && base.GameMode.trim()) ? base.GameMode.trim() :
+        (topLevelEntries && topLevelEntries.length
+          ? (topLevelEntries[0].nickname || topLevelEntries[0].type || 'TTS_Save')
+          : 'TTS_Save');
+
+  return sanitizeFileNameStrict(primary, 'TTS_Save');
+}
+
 function main() {
   if (!fs.existsSync(manifestPath)) {
     console.error('❌ manifest.json not found in ./src');
@@ -143,17 +189,11 @@ function main() {
   }
 
   fs.mkdirSync(buildDir, { recursive: true });
-  // Создаём archiveDir только локально; в CI архив отключён
+  // create archive dir only locally; archiving disabled in CI
   if (!isCI) fs.mkdirSync(archiveDir, { recursive: true });
 
   const manifest = readJSON(manifestPath);
   const base = readJSON(path.join(srcDir, 'base.json'));
-
-  const gameModeRaw = base.GameMode || 'GameMod';
-  const gameModeClean = sanitizeFileName(gameModeRaw);
-  const versionClean = sanitizeFileName(String(customVersion).replace(/^v+/i, '')); // for filename
-  const saveFileName = `${gameModeClean}_v${versionClean}.json`;
-  const outputFile = path.join(buildDir, saveFileName);
 
   // Verify manifest files exist
   manifest.forEach(fileExistsStrict);
@@ -170,12 +210,24 @@ function main() {
   const topLevel = manifestMap['__root__'] || [];
   const objectStates = topLevel.map(entry => loadObjectFromManifest(entry, manifestMap));
 
-  // Assemble final save
+  // Compose robust output filename
+  const baseName = pickBaseName(base, topLevel);
+
+  // version in filename: strip leading 'v' and sanitize strictly; default to 'dev' if empty
+  const versionTag = String(customVersion).trim().replace(/^v+/i, '');
+  let versionClean = sanitizeFileNameStrict(versionTag, 'dev');
+  // further restrict version to ASCII-safe (avoid non-ASCII in version part)
+  versionClean = versionClean.replace(/[^A-Za-z0-9._-]/g, '_');
+
+  const saveFileName = `${baseName}_v${versionClean}.json`;
+  const outputFile = path.join(buildDir, saveFileName);
+
+  // Assemble final save (fallback to baseName inside JSON if fields are empty)
   const merged = {
     ...base,
     ObjectStates: objectStates,
-    SaveName: gameModeRaw,
-    GameMode: gameModeRaw,
+    SaveName: (typeof base.SaveName === 'string' && base.SaveName.trim()) ? base.SaveName : baseName,
+    GameMode: (typeof base.GameMode === 'string' && base.GameMode.trim()) ? base.GameMode : baseName,
     VersionNumber: customVersion
   };
 
@@ -189,7 +241,7 @@ function main() {
   // In dev builds (version=vDEV) OR in CI — NO archiving, just overwrite
   const isDevBuild = /^v?dev$/i.test(String(customVersion).trim());
   if (!isDevBuild && !isCI) {
-    archivePreviousBuilds(gameModeRaw);
+    archivePreviousBuilds(merged.GameMode);
   } else {
     if (isDevBuild) {
       console.log('🧪 Dev build detected → archiving is disabled; file will be overwritten.');
@@ -204,7 +256,7 @@ function main() {
 
   console.log(`✅ Merged ${objectStates.length} objects`);
   console.log(`📁 Output saved to: ${outputFile}`);
-  console.log(`📝 GameMode: ${gameModeRaw}`);
+  console.log(`📝 GameMode: ${merged.GameMode}`);
   console.log(`🆕 Version: ${customVersion}`);
 }
 
