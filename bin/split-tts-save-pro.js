@@ -8,7 +8,7 @@ const inputPath = process.env.INPUT_SAVE || process.argv[2] || './Save.json';
 const outputDir = './src';
 const manifest = [];
 
-// Unicode-safe sanitize
+// Unicode-safe sanitize (stable across OS)
 const sanitize = (str, fallback = 'unnamed') => {
   let s = String(str || '')
     .normalize('NFC')
@@ -61,7 +61,14 @@ function generateContainerRelPath(parentObj) {
   return path.join('Contained', `${label}_${guid}`);
 }
 
-function saveObjectToFile(obj, relativePath, parentGuid = null) {
+/**
+ * Save object to disk and append to manifest.
+ * @param {*} obj TTS object
+ * @param {*} relativePath '.' for top-level, or Contained/... for children
+ * @param {*} parentGuid GUID of parent (null for top-level)
+ * @param {*} order zero-based index in original array (ObjectStates or ContainedObjects)
+ */
+function saveObjectToFile(obj, relativePath, parentGuid = null, order = 0) {
   const isTopLevel = relativePath === '.';
   const fileName = isTopLevel ? generateTopLevelFilename(obj) : generateNestedFilename(obj);
 
@@ -83,21 +90,23 @@ function saveObjectToFile(obj, relativePath, parentGuid = null) {
   delete objToWrite.LuaScriptState;
   fs.writeFileSync(jsonPath, JSON.stringify(objToWrite, null, 2), 'utf-8');
 
-  // Manifest entry — parent is GUID only (stable)
+  // Manifest entry — parent is GUID only (stable), order preserves original sequence
   manifest.push({
     type: obj.Name || 'Object',
     name: obj.Name || null,
     nickname: obj.Nickname || null,
     guid: obj.GUID || null,
     file: path.join(relativePath, fileName),
-    parent: parentGuid, // GUID of parent or null at top level
+    parent: parentGuid,   // GUID of parent or null at top level
+    order                 // index within original array
   });
 
-  // Recurse contained
+  // Recurse contained — IMPORTANT: iterate in original order, no sorting
   if (Array.isArray(obj.ContainedObjects) && obj.ContainedObjects.length) {
     const containerRelPath = generateContainerRelPath(obj); // folder uses Nickname/Name + GUID
-    for (const child of obj.ContainedObjects) {
-      saveObjectToFile(child, containerRelPath, obj.GUID || null);
+    for (let i = 0; i < obj.ContainedObjects.length; i++) {
+      const child = obj.ContainedObjects[i];
+      saveObjectToFile(child, containerRelPath, obj.GUID || null, i);
     }
   }
 }
@@ -126,9 +135,9 @@ function main() {
     process.exit(1);
   }
 
-  // Split top-level objects
-  for (const obj of data.ObjectStates) {
-    saveObjectToFile(obj, '.');
+  // Split top-level objects in exact original order
+  for (let i = 0; i < data.ObjectStates.length; i++) {
+    saveObjectToFile(data.ObjectStates[i], '.', null, i);
   }
 
   // Export Global scripts/UI and strip them from base
@@ -146,6 +155,7 @@ function main() {
 
   const { ObjectStates, LuaScript, LuaScriptState, XmlUI, ...base } = data;
   fs.writeFileSync(path.join(outputDir, 'base.json'), JSON.stringify(base, null, 2), 'utf-8');
+
   fs.writeFileSync(path.join(outputDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf-8');
 
   console.log(`✅ Successfully split ${manifest.length} objects.`);

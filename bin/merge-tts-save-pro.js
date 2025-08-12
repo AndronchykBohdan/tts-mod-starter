@@ -19,15 +19,14 @@ const getArg = (name) => {
   return i !== -1 && args[i + 1] ? args[i + 1] : null;
 };
 const customVersion = getArg('--version');
+const debug = args.includes('--debug');
 
 if (!customVersion) {
   console.error('❌ Please provide --version (e.g. --version v0.5.0)');
   process.exit(1);
 }
 
-/**
- * Strict, cross-platform file-name sanitizer (Unicode-friendly).
- */
+/** Unicode-safe, cross-platform file-name sanitizer */
 function sanitizeFileNameStrict(input, fallback = 'TTS_Save') {
   let s = String(input ?? '')
     .normalize('NFC')
@@ -59,6 +58,7 @@ function readJSON(filePath) {
   }
 }
 
+// Validate file exists AND its GUID matches manifest.guid (if both present)
 function fileExistsStrict(entry) {
   const fullPath = path.join(srcDir, entry.file);
   if (!fs.existsSync(fullPath)) {
@@ -66,9 +66,29 @@ function fileExistsStrict(entry) {
     console.error(`Expected path: ${fullPath}`);
     process.exit(1);
   }
+  try {
+    const json = JSON.parse(fs.readFileSync(fullPath, 'utf-8'));
+    if (entry.guid && json.GUID && entry.guid !== json.GUID) {
+      console.error(`❌ GUID mismatch: manifest(${entry.guid}) != file(${json.GUID}) at ${entry.file}`);
+      process.exit(1);
+    }
+  } catch {
+    console.error(`❌ Invalid JSON: ${fullPath}`);
+    process.exit(1);
+  }
 }
 
-// ⬇️ Children by parent GUID (stable) — updated
+/** Stable sort by .order, preserving insertion order when order is equal/undefined */
+function sortByOrderStable(arr) {
+  // Node 22 (V8) sort is stable; comparator keeps equal items in original order.
+  return arr.slice().sort((a, b) => {
+    const ao = (typeof a.order === 'number') ? a.order : Number.POSITIVE_INFINITY;
+    const bo = (typeof b.order === 'number') ? b.order : Number.POSITIVE_INFINITY;
+    return ao - bo;
+  });
+}
+
+// Children by parent GUID (stable, order-preserving)
 function loadObjectFromManifest(entry, manifestMap) {
   const jsonPath = path.join(srcDir, entry.file);
   const obj = readJSON(jsonPath);
@@ -79,7 +99,15 @@ function loadObjectFromManifest(entry, manifestMap) {
   if (fs.existsSync(luaPath)) obj.LuaScript = fs.readFileSync(luaPath, 'utf-8');
   if (fs.existsSync(statePath)) obj.LuaScriptState = fs.readFileSync(statePath, 'utf-8');
 
-  const children = manifestMap[entry.guid] || [];
+  // children come exactly in manifest order; additionally respect .order if present
+  const rawChildren = manifestMap[entry.guid] || [];
+  const children = sortByOrderStable(rawChildren);
+
+  if (debug) {
+    const orders = children.map(c => (typeof c.order === 'number') ? c.order : null);
+    console.log(`📦 ${path.basename(entry.file)} (GUID=${entry.guid || 'null'}) → children: ${children.length} | order: [${orders.join(', ')}]`);
+  }
+
   if (children.length > 0) {
     obj.ContainedObjects = children.map(child =>
       loadObjectFromManifest(child, manifestMap)
@@ -179,10 +207,10 @@ function main() {
   const manifest = readJSON(manifestPath);
   const base = readJSON(path.join(srcDir, 'base.json'));
 
-  // Verify manifest files exist
+  // Verify manifest files exist and GUIDs match
   manifest.forEach(fileExistsStrict);
 
-  // ⬇️ Group by parent GUID (or __root__) — updated
+  // Group by parent GUID (or __root__) — insertion order equals manifest order
   const manifestMap = {};
   for (const entry of manifest) {
     const key = entry.parent || '__root__'; // parent is GUID or null
@@ -190,8 +218,18 @@ function main() {
     manifestMap[key].push(entry);
   }
 
-  // Build ObjectStates in original order
-  const topLevel = manifestMap['__root__'] || [];
+  if (debug) {
+    const keys = Object.keys(manifestMap);
+    console.log(`🧩 Manifest groups: ${keys.length} keys`);
+    for (const k of keys) {
+      const label = (k === '__root__') ? '__root__' : `parent GUID ${k}`;
+      const orders = (manifestMap[k] || []).map(e => (typeof e.order === 'number') ? e.order : null);
+      console.log(`  - ${label}: ${manifestMap[k].length} item(s) | order: [${orders.join(', ')}]`);
+    }
+  }
+
+  // Top-level strictly by original order (.order), preserving insertion when missing
+  const topLevel = sortByOrderStable(manifestMap['__root__'] || []);
   const objectStates = topLevel.map(entry => loadObjectFromManifest(entry, manifestMap));
 
   // Compose robust output filename
