@@ -1,0 +1,69 @@
+name: Build & Attach TTS Save
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write  # needed to upload assets to a release
+
+jobs:
+  build-and-attach:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1) Checkout repo
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2) Setup Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # 3) Setup pnpm (guaranteed in PATH)
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      # 4) Install dependencies
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # 5) Fail early if src is missing or incomplete
+      - name: Verify src structure
+        run: |
+          if [ ! -f src/manifest.json ]; then
+            echo "manifest.json not found in ./src" >&2
+            exit 1
+          fi
+          if [ ! -f src/base.json ]; then
+            echo "base.json not found in ./src" >&2
+            exit 1
+          fi
+
+      # 6) Optional: minimal .env (paths default to ./src, ./build in code anyway)
+      - name: Create .env
+        run: |
+          echo "SRC_DIR=./src" >> .env
+
+      # 7) Merge with version from release tag (e.g. v0.2.0)
+      - name: Merge to TTS save
+        run: node bin/merge-tts-save-pro.js --version "${{ github.event.release.tag_name }}"
+
+      # 8) Upload build artifact (for Actions tab)
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tts-save-${{ github.event.release.tag_name }}
+          path: build/*.json
+
+      # 9) Attach JSON to the GitHub Release
+      - name: Attach JSON to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/*.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
