@@ -3,6 +3,7 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const { bundleXML } = require('./modules/xml-bundler');
+const { bundleLuaIfNeeded } = require('./modules/lua-bandler');
 
 const srcDir = process.env.SRC_DIR || './src';
 const buildDir = process.env.BUILD_DIR || './build';
@@ -110,140 +111,6 @@ function sortByOrderStable(arr) {
     .map(o => o.v);
 }
 
-/* ======================= luabundle‑style bundler (exact 1.6.0 format) ======================= */
-
-function readText(file) { return fs.readFileSync(file, 'utf-8'); }
-
-// require("id") or require 'id'
-const REQUIRE_RE = /(^|\s)require\s*(?:\(\s*["']([^"']+)["']\s*\)|\s+["']([^"']+)["'])/g;
-
-function findRequireIds(luaCode) {
-  const ids = new Set();
-  let m;
-  while ((m = REQUIRE_RE.exec(luaCode)) !== null) {
-    const id = m[2] || m[3];
-    if (id) ids.add(id);
-  }
-  return Array.from(ids);
-}
-
-function resolveModulePath(id) {
-  const parts = id.split('/').filter(Boolean);
-  const base = path.join(LIB_DIR, ...parts);
-  const candidates = [`${base}.lua`, `${base}.ttslua`];
-  for (const file of candidates) if (fs.existsSync(file)) return file;
-  return null;
-}
-
-// emit exact luabundle 1.6.0 header
-function emitLuabundleHeader() {
-  return `-- Bundled by luabundle {"version":"1.6.0"}
-local __bundle_require, __bundle_loaded, __bundle_register, __bundle_modules = (function(superRequire)
-\tlocal loadingPlaceholder = {[{}] = true}
-
-\tlocal register
-\tlocal modules = {}
-
-\tlocal require
-\tlocal loaded = {}
-
-\tregister = function(name, body)
-\t\tif not modules[name] then
-\t\t\tmodules[name] = body
-\t\tend
-\tend
-
-\trequire = function(name)
-\t\tlocal loadedModule = loaded[name]
-
-\t\tif loadedModule then
-\t\t\tif loadedModule == loadingPlaceholder then
-\t\t\t\treturn nil
-\t\t\tend
-\t\telse
-\t\t\tif not modules[name] then
-\t\t\t\tif not superRequire then
-\t\t\t\t\tlocal identifier = type(name) == 'string' and '\"' .. name .. '\"' or tostring(name)
-\t\t\t\t\terror('Tried to require ' .. identifier .. ', but no such module has been registered')
-\t\t\t\telse
-\t\t\t\t\treturn superRequire(name)
-\t\t\t\tend
-\t\t\tend
-
-\t\t\tloaded[name] = loadingPlaceholder
-\t\t\tloadedModule = modules[name](require, loaded, register, modules)
-\t\t\tloaded[name] = loadedModule
-\t\tend
-
-\t\treturn loadedModule
-\tend
-
-\treturn require, loaded, register, modules
-end)(nil)`;
-}
-
-function bundleLuaIfNeeded(rootCode, who = 'script') {
-  const requires = findRequireIds(rootCode);
-  if (requires.length === 0) {
-    // no require → return code unchanged, без рантайма и без return __bundle_require
-    if (debug) console.log(`ℹ️  No requires in ${who} → bundling skipped`);
-    return rootCode;
-  }
-
-  if (!fs.existsSync(LIB_DIR)) {
-    console.error(`❌ Lua requires detected in ${who}, but LIB_DIR not found: ${LIB_DIR}`);
-    console.error(`   Put your modules into ${LIB_DIR} (e.g., ${LIB_DIR}/util/serpent.lua)`);
-    process.exit(1);
-  }
-
-  const visited = new Set();
-  const modules = []; // { id, code }
-
-  function loadModule(id, chain = []) {
-    if (visited.has(id)) return;
-    visited.add(id);
-
-    const file = resolveModulePath(id);
-    if (!file) {
-      console.error(`❌ Missing Lua module "${id}" → expected: ${LIB_DIR}/${id}.lua or .ttslua`);
-      process.exit(1);
-    }
-    const code = readText(file);
-
-    for (const sub of findRequireIds(code)) {
-      if (chain.includes(sub)) {
-        console.warn(`⚠️  Circular require: ${[...chain, sub].join(' -> ')}`);
-        continue;
-      }
-      loadModule(sub, [...chain, id]);
-    }
-
-    modules.push({ id, code });
-  }
-
-  for (const id of requires) loadModule(id, ['__root']);
-
-  const out = [];
-  out.push(emitLuabundleHeader());
-
-  for (const m of modules) {
-    out.push(`__bundle_register("${m.id}", function(require, _LOADED, __bundle_register, __bundle_modules)
-${m.code}
-end)`);
-  }
-
-  out.push(`__bundle_register("__root", function(require, _LOADED, __bundle_register, __bundle_modules)
-${rootCode}
-end)
-
-return __bundle_require("__root")`);
-
-  if (debug) console.log(`🧵 Bundled ${modules.length} module(s) from ${LIB_DIR} for ${who}`);
-  return out.join('\n\n');
-}
-
-/* ======================= END bundler ======================= */
-
 function readObjectLuaIfExists(jsonPath) {
   const base = jsonPath.replace(/\.json$/i, '');
   const candidates = [`${base}.lua`, `${base}.ttslua`];
@@ -262,7 +129,7 @@ function loadObjectFromManifest(entry, manifestMap) {
   const memoPath = jsonPath.replace(/\.json$/i, '.memo.txt');
 
   if (rawCode != null) {
-    obj.LuaScript = bundleLuaIfNeeded(rawCode, `object:${entry.guid || 'noguid'}`);
+    obj.LuaScript = bundleLuaIfNeeded(rawCode, `object:${entry.guid || 'noguid'}`, { libDir: LIB_DIR, debug });
   }
   if (fs.existsSync(statePath)) obj.LuaScriptState = fs.readFileSync(statePath, 'utf-8');
   if (fs.existsSync(xmlPath)) obj.XmlUI = fs.readFileSync(xmlPath, 'utf-8');
@@ -418,7 +285,7 @@ function main() {
 
   if (globalLuaPath) {
     const rawGlobal = fs.readFileSync(globalLuaPath, 'utf-8');
-    merged.LuaScript = bundleLuaIfNeeded(rawGlobal, 'Global');
+    merged.LuaScript = bundleLuaIfNeeded(rawGlobal, 'Global', { libDir: LIB_DIR, debug });
   }
 
   // Global state
